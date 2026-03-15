@@ -10,13 +10,57 @@ const GRADE_LABELS = {
   4:'Dense shadow, bone not visible',
 }
 
+// Resize handle size in px (half-width of the square handle)
+const HANDLE_R = 6
+
+// Returns which resize handle (if any) the point (px, py) is over on box b.
+// Returns one of: 'nw','n','ne','e','se','s','sw','w', or null
+function getHandleAtPoint(px, py, b) {
+  const mx = b.x + b.w / 2
+  const my = b.y + b.h / 2
+  const handles = {
+    nw: [b.x,        b.y       ],
+    n:  [mx,         b.y       ],
+    ne: [b.x + b.w,  b.y       ],
+    e:  [b.x + b.w,  my        ],
+    se: [b.x + b.w,  b.y + b.h ],
+    s:  [mx,         b.y + b.h ],
+    sw: [b.x,        b.y + b.h ],
+    w:  [b.x,        my        ],
+  }
+  for (const [key, [hx, hy]] of Object.entries(handles)) {
+    if (Math.abs(px - hx) <= HANDLE_R + 2 && Math.abs(py - hy) <= HANDLE_R + 2) return key
+  }
+  return null
+}
+
+// Apply a resize drag delta to a box, returns new {x,y,w,h}
+function applyResize(box, handle, dx, dy) {
+  let { x, y, w, h } = box
+  if (handle.includes('n')) { y += dy; h -= dy }
+  if (handle.includes('s')) { h += dy }
+  if (handle.includes('w')) { x += dx; w -= dx }
+  if (handle.includes('e')) { w += dx }
+  // Prevent inverting (minimum size 10px)
+  if (w < 10) { if (handle.includes('w')) x = box.x + box.w - 10; w = 10 }
+  if (h < 10) { if (handle.includes('n')) y = box.y + box.h - 10; h = 10 }
+  return { x, y, w, h }
+}
+
+// Cursor style for each handle direction
+const HANDLE_CURSORS = {
+  nw:'nw-resize', n:'n-resize', ne:'ne-resize',
+  e:'e-resize', se:'se-resize', s:'s-resize',
+  sw:'sw-resize', w:'w-resize',
+}
+
 export default function AnnotatorPage() {
   const canvasRef    = useRef(null)
   const containerRef = useRef(null)
 
   const [image, setImage]             = useState(null)
-  const [boxes, setBoxes]             = useState([])       // finalized boxes shown on canvas
-  const [draftBox, setDraftBox]       = useState(null)     // box currently drawn, not yet confirmed
+  const [boxes, setBoxes]             = useState([])
+  const [draftBox, setDraftBox]       = useState(null)
   const [drawing, setDrawing]         = useState(false)
   const [startPos, setStartPos]       = useState(null)
   const [currentPos, setCurrentPos]   = useState(null)
@@ -37,14 +81,21 @@ export default function AnnotatorPage() {
   const [passInput, setPassInput]   = useState('')
   const [passError, setPassError]   = useState(false)
 
-  const PASSCODE = 'heckmatt2024'   // ← change this to whatever you want
+  // Resize state for the draft box
+  const [resizing, setResizing]         = useState(false)
+  const [resizeHandle, setResizeHandle] = useState(null)   // 'nw','n','ne', etc.
+  const [resizeStart, setResizeStart]   = useState(null)   // {x,y} mouse pos at drag start
+  const [resizeBoxOrigin, setResizeBoxOrigin] = useState(null) // box snapshot at drag start
+  const [hoverHandle, setHoverHandle]   = useState(null)   // for cursor feedback
+
+  const PASSCODE = 'heckmatt2024'
 
   const handlePassSubmit = () => {
     if (passInput === PASSCODE) { setAuthed(true); setPassError(false) }
     else { setPassError(true); setPassInput('') }
   }
 
-  const MAX_BOXES = 2   // max on first visit; revisit has no limit
+  const MAX_BOXES = 2
 
   // ── fetch next unannotated ────────────────────────────────────────────────
   const fetchNext = useCallback(async (skips, hist, hIdx, replaceCurrent = false) => {
@@ -88,10 +139,13 @@ export default function AnnotatorPage() {
       ctx.fillText(`Muscle ${i + 1}`, b.x + 6, b.y + 16)
     })
 
-    // Draw in-progress or draft box
-    const live = drawing && startPos && currentPos
+    // Draw in-progress draw (while dragging a new box)
+    const liveDrawing = drawing && startPos && currentPos
       ? { x:Math.min(startPos.x,currentPos.x), y:Math.min(startPos.y,currentPos.y), w:Math.abs(currentPos.x-startPos.x), h:Math.abs(currentPos.y-startPos.y) }
-      : draftBox
+      : null
+
+    // Draft box (drawn, pending confirm / resizable)
+    const live = liveDrawing || draftBox
 
     if (live) {
       ctx.shadowColor = color; ctx.shadowBlur = 14
@@ -105,8 +159,30 @@ export default function AnnotatorPage() {
         ctx.font = '11px IBM Plex Mono, monospace'; ctx.fillStyle = '#fff'
         ctx.fillText(`${Math.round(live.w)}×${Math.round(live.h)}`, live.x+6, live.y-6)
       }
+
+      // Draw resize handles only when it is the confirmed draft (not mid-draw)
+      if (!liveDrawing && draftBox) {
+        const mx = live.x + live.w / 2
+        const my = live.y + live.h / 2
+        const handlePoints = {
+          nw:[live.x,       live.y      ], n:[mx,        live.y      ], ne:[live.x+live.w,live.y      ],
+          e: [live.x+live.w,my          ], se:[live.x+live.w,live.y+live.h],
+          s: [mx,           live.y+live.h], sw:[live.x,  live.y+live.h], w:[live.x,my],
+        }
+        for (const [key, [hx, hy]] of Object.entries(handlePoints)) {
+          const isHovered = hoverHandle === key
+          // Outer glow ring
+          ctx.shadowColor = color; ctx.shadowBlur = isHovered ? 12 : 6
+          ctx.strokeStyle = color; ctx.lineWidth = 1.5
+          ctx.strokeRect(hx - HANDLE_R, hy - HANDLE_R, HANDLE_R*2, HANDLE_R*2)
+          ctx.shadowBlur = 0
+          // Inner fill
+          ctx.fillStyle = isHovered ? color : '#0a0e14'
+          ctx.fillRect(hx - HANDLE_R + 1, hy - HANDLE_R + 1, HANDLE_R*2 - 2, HANDLE_R*2 - 2)
+        }
+      }
     }
-  }, [boxes, draftBox, drawing, startPos, currentPos, imgLoaded, image])
+  }, [boxes, draftBox, drawing, startPos, currentPos, imgLoaded, image, hoverHandle])
 
   const getPos = (e) => {
     const r = canvasRef.current.getBoundingClientRect()
@@ -118,14 +194,64 @@ export default function AnnotatorPage() {
   const atLimit  = !isRevisit && boxes.length >= MAX_BOXES
   const hasDraft = !!draftBox
 
+  // ── pointer down ─────────────────────────────────────────────────────────
   const onMouseDown = (e) => {
+    e.preventDefault()
+    const p = getPos(e)
+
+    // Check if clicking on a resize handle of the draft box
+    if (draftBox) {
+      const handle = getHandleAtPoint(p.x, p.y, draftBox)
+      if (handle) {
+        setResizing(true)
+        setResizeHandle(handle)
+        setResizeStart(p)
+        setResizeBoxOrigin({ ...draftBox })
+        return
+      }
+    }
+
     if (atLimit) return
-    e.preventDefault(); setDraftBox(null); setDrawing(true)
-    const p = getPos(e); setStartPos(p); setCurrentPos(p)
+    setDraftBox(null); setDrawing(true)
+    setStartPos(p); setCurrentPos(p)
   }
-  const onMouseMove = (e) => { if (!drawing) return; e.preventDefault(); setCurrentPos(getPos(e)) }
-  const onMouseUp   = (e) => {
-    if (!drawing) return; e.preventDefault(); setDrawing(false)
+
+  // ── pointer move ──────────────────────────────────────────────────────────
+  const onMouseMove = (e) => {
+    e.preventDefault()
+    const p = getPos(e)
+
+    // Handle resize drag
+    if (resizing && resizeHandle && resizeBoxOrigin && resizeStart) {
+      const dx = p.x - resizeStart.x
+      const dy = p.y - resizeStart.y
+      const newBox = applyResize(resizeBoxOrigin, resizeHandle, dx, dy)
+      setDraftBox(newBox)
+      return
+    }
+
+    // Handle new box drawing
+    if (drawing) { setCurrentPos(p); return }
+
+    // Update hover handle cursor
+    if (draftBox) {
+      const handle = getHandleAtPoint(p.x, p.y, draftBox)
+      setHoverHandle(handle)
+    }
+  }
+
+  // ── pointer up ────────────────────────────────────────────────────────────
+  const onMouseUp = (e) => {
+    e.preventDefault()
+
+    if (resizing) {
+      setResizing(false); setResizeHandle(null)
+      setResizeStart(null); setResizeBoxOrigin(null)
+      return
+    }
+
+    if (!drawing) return
+    setDrawing(false)
     const end = getPos(e)
     const x=Math.min(startPos.x,end.x), y=Math.min(startPos.y,end.y)
     const w=Math.abs(end.x-startPos.x),  h=Math.abs(end.y-startPos.y)
@@ -133,18 +259,26 @@ export default function AnnotatorPage() {
     setStartPos(null); setCurrentPos(null)
   }
 
+  // ── cursor style ──────────────────────────────────────────────────────────
+  const getCanvasCursor = () => {
+    if (resizing && resizeHandle) return HANDLE_CURSORS[resizeHandle]
+    if (hoverHandle) return HANDLE_CURSORS[hoverHandle]
+    if (atLimit) return 'not-allowed'
+    return 'crosshair'
+  }
+
   // Confirm draft → add to boxes list
   const confirmBox = () => {
     if (!draftBox) return
     setBoxes(prev => [...prev, draftBox])
-    setDraftBox(null)
+    setDraftBox(null); setHoverHandle(null)
   }
 
   // Remove a finalized box
   const removeBox = (i) => setBoxes(prev => prev.filter((_, idx) => idx !== i))
 
   // Discard draft
-  const discardDraft = () => setDraftBox(null)
+  const discardDraft = () => { setDraftBox(null); setHoverHandle(null) }
 
   // ── Save All & Next ───────────────────────────────────────────────────────
   const handleSaveAll = async () => {
@@ -171,7 +305,6 @@ export default function AnnotatorPage() {
       })
       const data = await res.json()
       if (data.error) throw new Error(data.error)
-      // Mark current image as annotated in history so Prev shows it correctly
       const updatedHistory = history.map((h, i) =>
         i === historyIndex ? { ...h, is_annotated: true } : h
       )
@@ -193,18 +326,15 @@ export default function AnnotatorPage() {
 
   const handleNext = () => {
     if (historyIndex < history.length - 1) {
-      // Only go forward in history if that entry was actually saved
       const ni = historyIndex + 1
       const nextImg = history[ni]
       if (nextImg && nextImg.is_annotated) {
         setHistoryIndex(ni)
         loadImage(nextImg, true)
       } else {
-        // Replace the unsaved forward entry with a fresh image
         fetchNext(skippedIds, history, historyIndex, true)
       }
     } else {
-      // At end of history - replace current slot if unsaved, else append
       const currentSaved = boxes.length > 0 || image?.is_annotated
       fetchNext(skippedIds, history, historyIndex, !currentSaved)
     }
@@ -224,7 +354,7 @@ export default function AnnotatorPage() {
     setShowBrowse(false)
     const nh = [...history.slice(0, historyIndex + 1), { ...img, is_annotated: true }]
     setHistory(nh); setHistoryIndex(nh.length - 1)
-    loadImage(img, true)   // always a revisit from browse
+    loadImage(img, true)
   }
 
   const handleExport = async () => {
@@ -245,12 +375,12 @@ export default function AnnotatorPage() {
 
   const gradeColor = image ? GRADE_COLORS[image.grade] : '#00d4ff'
   const canSave    = boxes.length >= 1 && !hasDraft
+
   const canGoPrev  = historyIndex > 0
 
-  // Instructions based on state
   const getInstruction = () => {
+    if (hasDraft)                  return '↕ Drag the corner/edge handles to resize · then Confirm or Discard'
     if (atLimit && !hasDraft)      return `✓ Both muscles boxed — review below then click "Save & Next"`
-    if (hasDraft)                  return '↑ Confirm or discard this box before drawing another'
     if (boxes.length === 0)        return `↖ Draw box around Muscle 1 (${isRevisit ? 'new boxes will replace old ones' : 'min 1, max 2'})`
     if (boxes.length === 1 && !isRevisit) return '↖ Draw box around Muscle 2 (or skip if only one muscle)'
     return '↖ Draw another box if needed'
@@ -338,7 +468,8 @@ export default function AnnotatorPage() {
             <div style={{position:'relative',display:imgLoaded?'block':'none'}}>
               <img src={image.url} alt={image.filename} onLoad={onImageLoad}
                 style={{display:'block',width:displaySize.w||'auto',height:displaySize.h||'auto',userSelect:'none'}} draggable={false}/>
-              <canvas ref={canvasRef} style={{...S.canvas,cursor:atLimit?'not-allowed':'crosshair'}}
+              <canvas ref={canvasRef}
+                style={{...S.canvas, cursor: getCanvasCursor()}}
                 onMouseDown={onMouseDown} onMouseMove={onMouseMove} onMouseUp={onMouseUp} onMouseLeave={onMouseUp}
                 onTouchStart={onMouseDown} onTouchMove={onMouseMove} onTouchEnd={onMouseUp}/>
             </div>
@@ -350,7 +481,12 @@ export default function AnnotatorPage() {
           {/* Draft confirm / discard */}
           {hasDraft && (
             <div style={S.draftBar}>
-              <span style={{fontSize:12,color:'#c8d8e8',fontFamily:'IBM Plex Mono,monospace'}}>New box drawn</span>
+              <div style={{display:'flex',flexDirection:'column',gap:3}}>
+                <span style={{fontSize:12,color:'#c8d8e8',fontFamily:'IBM Plex Mono,monospace'}}>Box drawn</span>
+                <span style={{fontSize:11,color:'#5a7a99',fontFamily:'IBM Plex Mono,monospace'}}>
+                  {Math.round(draftBox.w)} × {Math.round(draftBox.h)} px — drag handles to resize
+                </span>
+              </div>
               <div style={{display:'flex',gap:8}}>
                 <button style={S.discardBtn} onClick={discardDraft}>✕ Discard</button>
                 <button style={{...S.confirmBtn,background:gradeColor,color:'#000'}} onClick={confirmBox}>✓ Confirm Box</button>
