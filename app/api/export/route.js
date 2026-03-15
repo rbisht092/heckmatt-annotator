@@ -6,12 +6,18 @@ export const dynamic = 'force-dynamic'
 export async function GET() {
   const supabase = createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+    {
+    global: {
+      fetch: (url, options = {}) =>
+        fetch(url, { ...options, cache: 'no-store' }),  // ← new
+    },
+  }
   )
 
   const { data, error } = await supabase
     .from('annotations')
-    .select('yolo_txt, images(filename, heckmatt_grade)')
+    .select('yolo_txt, x_center, y_center, images(filename, heckmatt_grade)')
 
   if (error) return Response.json({ error: error.message }, { status: 500 })
   if (!data || data.length === 0) {
@@ -19,6 +25,7 @@ export async function GET() {
   }
 
   // Group all yolo lines by image (one image can have 2 boxes = 2 rows)
+  console.log(data)
   const imageMap = {}
   for (const row of data) {
     const filename = row.images?.filename || 'unknown'
