@@ -98,11 +98,12 @@ export default function AnnotatorPage() {
   const MAX_BOXES = 2
 
   // ── fetch next unannotated ────────────────────────────────────────────────
-  const fetchNext = useCallback(async (skips, hist, hIdx, replaceCurrent = false) => {
+  const fetchNext = useCallback(async (skips, hist, hIdx, replaceCurrent = false, excludeId = null) => {
     setStatus('loading'); setBoxes([]); setDraftBox(null); setImgLoaded(false); setIsRevisit(false)
     try {
-      const q = skips.length ? `?skip=${skips.join(',')}` : ''
-      const res  = await fetch(`/api/images${q}`)
+      const allExcludes = excludeId ? [...skips, excludeId] : skips
+      const q = allExcludes.length ? `?skip=${allExcludes.join(',')}` : ''
+      const res  = await fetch(`/api/images${q}${q?'&':'?'}t=${Date.now()}`, { cache: 'no-store' })
       const data = await res.json()
       if (data.done) { setStatus('done'); return }
       const nh = replaceCurrent && hIdx >= 0 ? [...hist.slice(0, hIdx), data] : [...hist.slice(0, hIdx + 1), data]
@@ -309,7 +310,8 @@ export default function AnnotatorPage() {
         i === historyIndex ? { ...h, is_annotated: true } : h
       )
       setHistory(updatedHistory)
-      fetchNext(skippedIds, updatedHistory, historyIndex)
+      // Exclude just-saved image once to avoid race condition, don't add to skippedIds
+      fetchNext(skippedIds, updatedHistory, historyIndex, false, image.id)
     } catch { setStatus('error') }
   }
 
@@ -343,7 +345,7 @@ export default function AnnotatorPage() {
   const openBrowse = async () => {
     setShowBrowse(true); setBrowseLoading(true)
     try {
-      const res = await fetch('/api/images?annotated=true')
+      const res = await fetch('/api/images?annotated=true&t=' + Date.now(), { cache: 'no-store' })
       const data = await res.json()
       setAnnotatedList(data.images || [])
     } catch { setAnnotatedList([]) }
@@ -358,7 +360,7 @@ export default function AnnotatorPage() {
   }
 
   const handleExport = async () => {
-    const res = await fetch('/api/export'); const blob = await res.blob()
+    const res = await fetch('/api/export?t=' + Date.now(), { cache: 'no-store' }); const blob = await res.blob()
     const url = URL.createObjectURL(blob); const a = document.createElement('a')
     a.href = url; a.download = 'labels.zip'; a.click(); URL.revokeObjectURL(url)
   }

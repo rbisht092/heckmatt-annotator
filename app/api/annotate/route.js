@@ -1,5 +1,7 @@
 import { createClient } from '@supabase/supabase-js'
 
+export const dynamic = 'force-dynamic'
+
 export async function POST(request) {
   const supabase = createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL,
@@ -18,7 +20,6 @@ export async function POST(request) {
   }
 
   const class_id = heckmatt_grade - 1
-
   const rows = boxes.map(b => ({
     image_id,
     x_center: b.x_center,

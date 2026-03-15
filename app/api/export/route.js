@@ -1,6 +1,8 @@
 import { createClient } from '@supabase/supabase-js'
 import JSZip from 'jszip'
 
+export const dynamic = 'force-dynamic'
+
 export async function GET() {
   const supabase = createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL,
