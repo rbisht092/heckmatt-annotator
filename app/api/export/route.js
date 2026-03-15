@@ -1,13 +1,12 @@
 import { createClient } from '@supabase/supabase-js'
 import JSZip from 'jszip'
 
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
-)
-
 export async function GET() {
-  // Fetch annotations joined with image filename + grade (grade determines subfolder)
+  const supabase = createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  )
+
   const { data, error } = await supabase
     .from('annotations')
     .select('yolo_txt, images(filename, heckmatt_grade)')
@@ -17,23 +16,20 @@ export async function GET() {
     return Response.json({ error: 'No annotations yet' }, { status: 404 })
   }
 
-  // Group all yolo lines by image (one image can have multiple boxes = multiple rows)
+  // Group all yolo lines by image (one image can have 2 boxes = 2 rows)
   const imageMap = {}
   for (const row of data) {
     const filename = row.images?.filename || 'unknown'
     const grade    = row.images?.heckmatt_grade || 1
-    const key      = filename
-    if (!imageMap[key]) imageMap[key] = { filename, grade, lines: [] }
-    imageMap[key].lines.push(row.yolo_txt)
+    if (!imageMap[filename]) imageMap[filename] = { filename, grade, lines: [] }
+    imageMap[filename].lines.push(row.yolo_txt)
   }
 
   const zip = new JSZip()
 
   for (const { filename, grade, lines } of Object.values(imageMap)) {
-    // Mirror source folder structure: labels/grade1/img_gmc1_1.txt
     const labelFilename = filename.replace(/\.[^/.]+$/, '') + '.txt'
-    const folderPath    = `labels/grade${grade}`
-    zip.folder(folderPath).file(labelFilename, lines.join('\n'))
+    zip.folder(`labels/grade${grade}`).file(labelFilename, lines.join('\n'))
   }
 
   const zipBuffer = await zip.generateAsync({ type: 'nodebuffer' })
