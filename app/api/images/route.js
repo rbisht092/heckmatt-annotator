@@ -56,7 +56,7 @@ export async function GET(request) {
   return Response.json({
     id:       image.id,
     filename: image.filename,
-    grade:    image.heckmatt_grade,
+    grade:    image.heckmatt_grade ?? null,   // null for unlabeled images
     url:      image.cloudinary_url,
   })
 }

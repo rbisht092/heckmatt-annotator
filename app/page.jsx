@@ -69,6 +69,7 @@ export default function AnnotatorPage() {
   const [imgLoaded, setImgLoaded]     = useState(false)
   const [displaySize, setDisplaySize] = useState({ w:0, h:0 })
   const [isRevisit, setIsRevisit]     = useState(false)
+  const [selectedGrade, setSelectedGrade] = useState(null)  // for unlabeled images
 
   const [history, setHistory]           = useState([])
   const [historyIndex, setHistoryIndex] = useState(-1)
@@ -77,9 +78,23 @@ export default function AnnotatorPage() {
   const [annotatedList, setAnnotatedList] = useState([])
   const [browseLoading, setBrowseLoading] = useState(false)
 
+  // Upload modal
+  const [showUpload, setShowUpload]       = useState(false)
+  const [uploadFiles, setUploadFiles]     = useState([])   // [{file, status, reason}]
+  const [uploading, setUploading]         = useState(false)
+  const uploadInputRef                    = useRef(null)
+
   const [authed, setAuthed]         = useState(false)
   const [passInput, setPassInput]   = useState('')
   const [passError, setPassError]   = useState(false)
+
+  // Progress dashboard
+  const [showDash, setShowDash]     = useState(false)
+  const [stats, setStats]           = useState(null)
+  const [statsLoading, setStatsLoading] = useState(false)
+
+  // Quality warnings
+  const [qualityWarnings, setQualityWarnings] = useState([])
 
   // Resize state for the draft box
   const [resizing, setResizing]         = useState(false)
@@ -117,6 +132,8 @@ export default function AnnotatorPage() {
   const loadImage = (img, revisit = false) => {
     setBoxes([]); setDraftBox(null); setImgLoaded(false)
     setIsRevisit(revisit); setImage(img); setStatus('ready')
+    setQualityWarnings([])
+    setSelectedGrade(null)
   }
 
   // ── canvas rendering ──────────────────────────────────────────────────────
@@ -192,8 +209,10 @@ export default function AnnotatorPage() {
     return { x: Math.max(0,Math.min(cx-r.left, canvasRef.current.width)), y: Math.max(0,Math.min(cy-r.top, canvasRef.current.height)) }
   }
 
-  const atLimit  = !isRevisit && boxes.length >= MAX_BOXES
-  const hasDraft = !!draftBox
+  const atLimit    = !isRevisit && boxes.length >= MAX_BOXES
+  const hasDraft   = !!draftBox
+  const isUnlabeled = image?.grade === null
+  const canDraw    = !isUnlabeled || selectedGrade !== null
 
   // ── pointer down ─────────────────────────────────────────────────────────
   const onMouseDown = (e) => {
@@ -213,6 +232,7 @@ export default function AnnotatorPage() {
     }
 
     if (atLimit) return
+    if (!canDraw) return
     setDraftBox(null); setDrawing(true)
     setStartPos(p); setCurrentPos(p)
   }
@@ -264,6 +284,7 @@ export default function AnnotatorPage() {
   const getCanvasCursor = () => {
     if (resizing && resizeHandle) return HANDLE_CURSORS[resizeHandle]
     if (hoverHandle) return HANDLE_CURSORS[hoverHandle]
+    if (!canDraw) return 'not-allowed'
     if (atLimit) return 'not-allowed'
     return 'crosshair'
   }
@@ -271,12 +292,18 @@ export default function AnnotatorPage() {
   // Confirm draft → add to boxes list
   const confirmBox = () => {
     if (!draftBox) return
-    setBoxes(prev => [...prev, draftBox])
+    const newBoxes = [...boxes, draftBox]
+    setBoxes(newBoxes)
+    if (canvasRef.current) checkQuality(newBoxes, canvasRef.current.width, canvasRef.current.height)
     setDraftBox(null); setHoverHandle(null)
   }
 
   // Remove a finalized box
-  const removeBox = (i) => setBoxes(prev => prev.filter((_, idx) => idx !== i))
+  const removeBox = (i) => {
+    const newBoxes = boxes.filter((_, idx) => idx !== i)
+    setBoxes(newBoxes)
+    if (canvasRef.current) checkQuality(newBoxes, canvasRef.current.width, canvasRef.current.height)
+  }
 
   // Discard draft
   const discardDraft = () => { setDraftBox(null); setHoverHandle(null) }
@@ -284,6 +311,8 @@ export default function AnnotatorPage() {
   // ── Save All & Next ───────────────────────────────────────────────────────
   const handleSaveAll = async () => {
     if (boxes.length === 0 || !image) return
+    const effectiveGrade = image.grade ?? selectedGrade
+    if (!effectiveGrade) return   // shouldn't reach save without a grade
     setStatus('saving')
     const cw = canvasRef.current.width, ch = canvasRef.current.height
     const normalizedBoxes = boxes.map(b => ({
@@ -297,20 +326,20 @@ export default function AnnotatorPage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          image_id:       image.id,
-          boxes:          normalizedBoxes,
-          heckmatt_grade: image.grade,
-          image_filename: image.filename,
-          is_revisit:     isRevisit,
+          image_id:          image.id,
+          boxes:             normalizedBoxes,
+          heckmatt_grade:    effectiveGrade,
+          image_filename:    image.filename,
+          is_revisit:        isRevisit,
+          grade_was_assigned: image.grade === null,  // true when image had no grade
         }),
       })
       const data = await res.json()
       if (data.error) throw new Error(data.error)
       const updatedHistory = history.map((h, i) =>
-        i === historyIndex ? { ...h, is_annotated: true } : h
+        i === historyIndex ? { ...h, is_annotated: true, grade: effectiveGrade } : h
       )
       setHistory(updatedHistory)
-      // Exclude just-saved image once to avoid race condition, don't add to skippedIds
       fetchNext(skippedIds, updatedHistory, historyIndex, false, image.id)
     } catch { setStatus('error') }
   }
@@ -340,6 +369,119 @@ export default function AnnotatorPage() {
       const currentSaved = boxes.length > 0 || image?.is_annotated
       fetchNext(skippedIds, history, historyIndex, !currentSaved)
     }
+  }
+
+  // ── Progress dashboard ────────────────────────────────────────────────────
+  const openDash = async () => {
+    setShowDash(true); setStatsLoading(true)
+    try {
+      const res = await fetch('/api/stats?t=' + Date.now(), { cache: 'no-store' })
+      const data = await res.json()
+      setStats(data)
+    } catch { setStats(null) }
+    setStatsLoading(false)
+  }
+
+  // ── Delete annotation ─────────────────────────────────────────────────────
+  const handleUnannotate = async (imgId) => {
+    if (!window.confirm('Remove all annotations for this image and mark it unannotated?')) return
+    const res = await fetch(`/api/unannotate?image_id=${imgId}`, { method: 'DELETE' })
+    const data = await res.json()
+    if (data.success) {
+      setAnnotatedList(prev => prev.filter(i => i.id !== imgId))
+      setHistory(prev => prev.map(h => h.id === imgId ? { ...h, is_annotated: false } : h))
+      if (image?.id === imgId) { setBoxes([]); setIsRevisit(false) }
+    }
+  }
+
+  // ── Quality check: warn if box area is suspiciously small or large ────────
+  const checkQuality = useCallback((newBoxes, cw, ch) => {
+    const warnings = []
+    const imageArea = cw * ch
+    newBoxes.forEach((b, i) => {
+      const area = b.w * b.h
+      const pct  = (area / imageArea) * 100
+      if (pct < 0.5)  warnings.push(`Muscle ${i+1}: box seems very small (${pct.toFixed(1)}% of image)`)
+      if (pct > 60)   warnings.push(`Muscle ${i+1}: box seems very large (${pct.toFixed(1)}% of image)`)
+      if (b.w < 20 || b.h < 20) warnings.push(`Muscle ${i+1}: box may be too narrow — check dimensions`)
+    })
+    setQualityWarnings(warnings)
+  }, [])
+
+  // ── Keyboard shortcuts ────────────────────────────────────────────────────
+  useEffect(() => {
+    const onKey = (e) => {
+      // Don't fire when typing in inputs
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
+      if (!authed || status !== 'ready') return
+
+      if (e.key === 'Enter') {
+        if (hasDraft) confirmBox()
+      }
+      if (e.key === 'Escape') {
+        if (hasDraft) discardDraft()
+        if (showBrowse) setShowBrowse(false)
+        if (showDash)   setShowDash(false)
+      }
+      if ((e.key === 'z' || e.key === 'Z') && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault()
+        if (hasDraft) { discardDraft(); return }
+        setBoxes(prev => prev.slice(0, -1))
+      }
+      if (e.key === 's' || e.key === 'S') {
+        if (!e.metaKey && !e.ctrlKey && canSave) handleSaveAll()
+      }
+      if (e.key === 'k' || e.key === 'K') {
+        if (!e.metaKey && !e.ctrlKey) handleSkip()
+      }
+      if (e.key === 'ArrowLeft')  handlePrev()
+      if (e.key === 'ArrowRight') handleNext()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authed, status, hasDraft, showBrowse, showDash])
+
+  // ── Upload images ─────────────────────────────────────────────────────────
+  const onUploadFilePick = (e) => {
+    const picked = Array.from(e.target.files || [])
+    setUploadFiles(picked.map(f => ({ file: f, status: 'pending', reason: null })))
+  }
+
+  const onUploadDrop = (e) => {
+    e.preventDefault()
+    const dropped = Array.from(e.dataTransfer.files || []).filter(f => f.type.startsWith('image/'))
+    setUploadFiles(dropped.map(f => ({ file: f, status: 'pending', reason: null })))
+  }
+
+  const handleUpload = async () => {
+    if (uploadFiles.length === 0 || uploading) return
+    setUploading(true)
+
+    // Mark all as uploading
+    setUploadFiles(prev => prev.map(f => ({ ...f, status: 'uploading' })))
+
+    const form = new FormData()
+    uploadFiles.forEach(({ file }) => form.append('files', file))
+
+    try {
+      const res  = await fetch('/api/upload', { method: 'POST', body: form })
+      const data = await res.json()
+
+      setUploadFiles(prev => prev.map(({ file }) => {
+        const result = data.results?.find(r => r.filename === file.name)
+        return { file, status: result?.status || 'error', reason: result?.reason || null }
+      }))
+    } catch {
+      setUploadFiles(prev => prev.map(f => ({ ...f, status: 'error', reason: 'Network error' })))
+    }
+
+    setUploading(false)
+  }
+
+  const closeUpload = () => {
+    setShowUpload(false)
+    setUploadFiles([])
   }
 
   const openBrowse = async () => {
@@ -375,16 +517,18 @@ export default function AnnotatorPage() {
     setImgLoaded(true)
   }
 
-  const gradeColor = image ? GRADE_COLORS[image.grade] : '#00d4ff'
-  const canSave    = boxes.length >= 1 && !hasDraft
+  const effectiveGrade = image?.grade ?? selectedGrade
+  const gradeColor = effectiveGrade ? GRADE_COLORS[effectiveGrade] : '#00d4ff'
+  const canSave    = boxes.length >= 1 && !hasDraft && (!isUnlabeled || selectedGrade !== null)
 
   const canGoPrev  = historyIndex > 0
 
   const getInstruction = () => {
-    if (hasDraft)                  return '↕ Drag the corner/edge handles to resize · then Confirm or Discard'
-    if (atLimit && !hasDraft)      return `✓ Both muscles boxed — review below then click "Save & Next"`
-    if (boxes.length === 0)        return `↖ Draw box around Muscle 1 (${isRevisit ? 'new boxes will replace old ones' : 'min 1, max 2'})`
-    if (boxes.length === 1 && !isRevisit) return '↖ Draw box around Muscle 2 (or skip if only one muscle)'
+    if (isUnlabeled && !selectedGrade)         return '⚠ Assign a Heckmatt grade (1–4) above before drawing boxes'
+    if (hasDraft)                              return '↕ Drag the corner/edge handles to resize · then Confirm or Discard'
+    if (atLimit && !hasDraft)                  return `✓ Both muscles boxed — review below then click "Save & Next"`
+    if (boxes.length === 0)                    return `↖ Draw box around Muscle 1 (${isRevisit ? 'new boxes will replace old ones' : 'min 1, max 2'})`
+    if (boxes.length === 1 && !isRevisit)      return '↖ Draw box around Muscle 2 (or skip if only one muscle)'
     return '↖ Draw another box if needed'
   }
 
@@ -419,6 +563,8 @@ export default function AnnotatorPage() {
           <span style={S.subtitle}>USG Annotation Tool</span>
         </div>
         <div style={S.headerRight}>
+          <button style={S.hBtn} onClick={() => setShowUpload(true)}>↑ Upload Images</button>
+          <button style={S.hBtn} onClick={openDash}>◎ Progress</button>
           <button style={S.hBtn} onClick={openBrowse}>☰ Browse All</button>
           <button style={S.hBtn} onClick={handleExport}>↓ Export YOLO</button>
         </div>
@@ -456,11 +602,39 @@ export default function AnnotatorPage() {
               <span style={S.filename}>{image.filename}</span>
               <button style={{...S.navBtn,cursor:'pointer'}} onClick={handleNext}>Next →</button>
             </div>
-            <div style={{display:'flex',alignItems:'center',gap:8}}>
+            <div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap',justifyContent:'flex-end'}}>
               {isRevisit && <span style={S.revisitBadge}>Revisit — boxes will overwrite</span>}
-              <div style={{...S.gradeBadge,background:gradeColor+'22',border:`1px solid ${gradeColor}`,color:gradeColor}}>
-                Grade {image.grade} — {GRADE_LABELS[image.grade]}
-              </div>
+              {isUnlabeled ? (
+                <div style={S.gradePickerWrap}>
+                  <span style={{fontFamily:'IBM Plex Mono,monospace',fontSize:11,color:'#f97316'}}>⚠ Unlabeled — assign grade:</span>
+                  <div style={{display:'flex',gap:6}}>
+                    {[1,2,3,4].map(g => (
+                      <button
+                        key={g}
+                        style={{
+                          ...S.gradeBtn,
+                          background: selectedGrade === g ? GRADE_COLORS[g] : GRADE_COLORS[g]+'22',
+                          border: `1px solid ${GRADE_COLORS[g]}`,
+                          color:  selectedGrade === g ? '#000' : GRADE_COLORS[g],
+                          fontWeight: selectedGrade === g ? 700 : 400,
+                        }}
+                        onClick={() => setSelectedGrade(g)}
+                      >
+                        {g}
+                      </button>
+                    ))}
+                  </div>
+                  {selectedGrade && (
+                    <span style={{fontFamily:'IBM Plex Mono,monospace',fontSize:11,color:GRADE_COLORS[selectedGrade]}}>
+                      Grade {selectedGrade} — {GRADE_LABELS[selectedGrade]}
+                    </span>
+                  )}
+                </div>
+              ) : (
+                <div style={{...S.gradeBadge,background:gradeColor+'22',border:`1px solid ${gradeColor}`,color:gradeColor}}>
+                  Grade {image.grade} — {GRADE_LABELS[image.grade]}
+                </div>
+              )}
             </div>
           </div>
 
@@ -508,6 +682,16 @@ export default function AnnotatorPage() {
             </div>
           )}
 
+          {/* Quality warnings */}
+          {qualityWarnings.length > 0 && (
+            <div style={S.warnBox}>
+              <span style={{color:'#f97316',fontSize:12,fontFamily:'IBM Plex Mono,monospace',fontWeight:600}}>⚠ Quality check</span>
+              {qualityWarnings.map((w, i) => (
+                <div key={i} style={{color:'#f9731699',fontSize:11,fontFamily:'IBM Plex Mono,monospace',marginTop:3}}>{w}</div>
+              ))}
+            </div>
+          )}
+
           {/* Actions */}
           <div style={S.actions}>
             <button style={S.skipBtn} onClick={handleSkip} disabled={status==='saving'}>Skip →</button>
@@ -523,6 +707,15 @@ export default function AnnotatorPage() {
             >
               {status==='saving' ? 'Saving...' : `Save & Next (${boxes.length} box${boxes.length!==1?'es':''})`}
             </button>
+          </div>
+          <div style={S.shortcuts}>
+            <span>⌨ Shortcuts:</span>
+            <span><kbd style={S.kbd}>S</kbd> Save</span>
+            <span><kbd style={S.kbd}>K</kbd> Skip</span>
+            <span><kbd style={S.kbd}>Enter</kbd> Confirm box</span>
+            <span><kbd style={S.kbd}>Esc</kbd> Discard</span>
+            <span><kbd style={S.kbd}>⌘Z</kbd> Undo</span>
+            <span><kbd style={S.kbd}>← →</kbd> Navigate</span>
           </div>
         </>)}
 
@@ -552,10 +745,170 @@ export default function AnnotatorPage() {
                 <img src={img.url} alt={img.filename} style={S.thumb}/>
                 <div style={S.browseInfo}>
                   <div style={S.browseName}>{img.filename}</div>
-                  <div style={{...S.pill,background:GRADE_COLORS[img.grade]+'22',color:GRADE_COLORS[img.grade],border:`1px solid ${GRADE_COLORS[img.grade]}`}}>Grade {img.grade}</div>
+                  <div style={{display:'flex',gap:6,alignItems:'center',flexWrap:'wrap'}}>
+                    <div style={{...S.pill,background:GRADE_COLORS[img.grade]+'22',color:GRADE_COLORS[img.grade],border:`1px solid ${GRADE_COLORS[img.grade]}`}}>Grade {img.grade}</div>
+                    <button
+                      style={S.deleteBtn}
+                      onClick={e => { e.stopPropagation(); handleUnannotate(img.id) }}
+                    >🗑 Delete</button>
+                  </div>
                 </div>
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {/* Progress dashboard */}
+      {showDash && (
+        <div style={S.overlay} onClick={() => setShowDash(false)}>
+          <div style={{...S.panel, width: 420}} onClick={e => e.stopPropagation()}>
+            <div style={S.panelHeader}>
+              <span style={S.panelTitle}>◎ Progress Dashboard</span>
+              <button style={S.closeBtn} onClick={() => setShowDash(false)}>✕</button>
+            </div>
+            {statsLoading && <div style={{display:'flex',justifyContent:'center',padding:40}}><div style={S.spinner}/></div>}
+            {!statsLoading && stats && (() => {
+              const pct = stats.total > 0 ? Math.round((stats.annotated / stats.total) * 100) : 0
+              return (
+                <div style={{padding:'24px 24px 32px'}}>
+                  {/* Overall bar */}
+                  <div style={{marginBottom:28}}>
+                    <div style={{display:'flex',justifyContent:'space-between',marginBottom:8}}>
+                      <span style={{fontFamily:'IBM Plex Mono,monospace',fontSize:13,color:'#c8d8e8'}}>Overall Progress</span>
+                      <span style={{fontFamily:'IBM Plex Mono,monospace',fontSize:13,color:'#00d4ff'}}>{stats.annotated} / {stats.total}</span>
+                    </div>
+                    <div style={{height:10,background:'#1e2d45',borderRadius:5,overflow:'hidden'}}>
+                      <div style={{height:'100%',width:`${pct}%`,background:'#00d4ff',borderRadius:5,transition:'width 0.5s'}}/>
+                    </div>
+                    <div style={{display:'flex',justifyContent:'space-between',marginTop:6}}>
+                      <span style={{fontFamily:'IBM Plex Mono,monospace',fontSize:11,color:'#5a7a99'}}>{pct}% complete</span>
+                      <span style={{fontFamily:'IBM Plex Mono,monospace',fontSize:11,color:'#5a7a99'}}>{stats.remaining} remaining</span>
+                    </div>
+                  </div>
+                  {/* Per-grade breakdown */}
+                  <div style={{fontFamily:'IBM Plex Mono,monospace',fontSize:12,color:'#5a7a99',marginBottom:12,letterSpacing:'0.06em'}}>BY GRADE</div>
+                  {[1,2,3,4].map(g => {
+                    const gd  = stats.byGrade[g] || { total: 0, annotated: 0 }
+                    const gPct = gd.total > 0 ? Math.round((gd.annotated / gd.total) * 100) : 0
+                    const col  = GRADE_COLORS[g]
+                    return (
+                      <div key={g} style={{marginBottom:16}}>
+                        <div style={{display:'flex',justifyContent:'space-between',marginBottom:5}}>
+                          <div style={{display:'flex',alignItems:'center',gap:8}}>
+                            <div style={{width:10,height:10,borderRadius:2,background:col}}/>
+                            <span style={{fontFamily:'IBM Plex Mono,monospace',fontSize:12,color:'#c8d8e8'}}>Grade {g}</span>
+                          </div>
+                          <span style={{fontFamily:'IBM Plex Mono,monospace',fontSize:12,color:col}}>{gd.annotated}/{gd.total} ({gPct}%)</span>
+                        </div>
+                        <div style={{height:6,background:'#1e2d45',borderRadius:3,overflow:'hidden'}}>
+                          <div style={{height:'100%',width:`${gPct}%`,background:col,borderRadius:3,transition:'width 0.5s'}}/>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )
+            })()}
+            {!statsLoading && !stats && (
+              <div style={{padding:32,color:'#ef4444',textAlign:'center',fontSize:13}}>Failed to load stats</div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Upload modal */}
+      {showUpload && (
+        <div style={S.overlay} onClick={closeUpload}>
+          <div style={{...S.panel, width: 460}} onClick={e => e.stopPropagation()}>
+            <div style={S.panelHeader}>
+              <span style={S.panelTitle}>↑ Upload Images</span>
+              <button style={S.closeBtn} onClick={closeUpload}>✕</button>
+            </div>
+
+            <div style={{padding: 24, display:'flex', flexDirection:'column', gap:16}}>
+
+              {/* Drop zone */}
+              <div
+                style={S.dropZone}
+                onDragOver={e => e.preventDefault()}
+                onDrop={onUploadDrop}
+                onClick={() => uploadInputRef.current?.click()}
+              >
+                <div style={{fontSize: 28, marginBottom: 8}}>📂</div>
+                <div style={{fontFamily:'IBM Plex Mono,monospace', fontSize:13, color:'#c8d8e8'}}>
+                  Drag & drop images here
+                </div>
+                <div style={{fontFamily:'IBM Plex Mono,monospace', fontSize:11, color:'#5a7a99', marginTop:4}}>
+                  or click to browse — .jpg .png .tif .bmp
+                </div>
+                <input
+                  ref={uploadInputRef}
+                  type="file"
+                  multiple
+                  accept="image/*"
+                  style={{display:'none'}}
+                  onChange={onUploadFilePick}
+                />
+              </div>
+
+              {/* File list */}
+              {uploadFiles.length > 0 && (
+                <div style={{display:'flex', flexDirection:'column', gap:6, maxHeight:240, overflowY:'auto'}}>
+                  {uploadFiles.map(({ file, status, reason }, i) => {
+                    const icon = status === 'ok' ? '✓' : status === 'error' ? '✕' : status === 'skipped' ? '—' : status === 'uploading' ? '…' : '○'
+                    const col  = status === 'ok' ? '#22c55e' : status === 'error' ? '#ef4444' : status === 'skipped' ? '#eab308' : '#5a7a99'
+                    return (
+                      <div key={i} style={{display:'flex', alignItems:'center', gap:10, padding:'6px 10px', background:'#0a0e14', borderRadius:4, border:'1px solid #1e2d45'}}>
+                        <span style={{color:col, fontFamily:'IBM Plex Mono,monospace', fontSize:13, width:14, textAlign:'center'}}>{icon}</span>
+                        <span style={{flex:1, fontFamily:'IBM Plex Mono,monospace', fontSize:11, color:'#8aa8c8', wordBreak:'break-all'}}>{file.name}</span>
+                        <span style={{fontFamily:'IBM Plex Mono,monospace', fontSize:10, color:'#5a7a99'}}>{(file.size/1024).toFixed(0)}KB</span>
+                        {reason && <span style={{fontFamily:'IBM Plex Mono,monospace', fontSize:10, color:col}}>{reason}</span>}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+
+              {/* Summary after upload */}
+              {uploadFiles.length > 0 && !uploading && uploadFiles.some(f => f.status !== 'pending') && (() => {
+                const ok      = uploadFiles.filter(f => f.status === 'ok').length
+                const skipped = uploadFiles.filter(f => f.status === 'skipped').length
+                const errors  = uploadFiles.filter(f => f.status === 'error').length
+                return (
+                  <div style={{fontFamily:'IBM Plex Mono,monospace', fontSize:12, color:'#5a7a99', display:'flex', gap:16}}>
+                    {ok      > 0 && <span style={{color:'#22c55e'}}>✓ {ok} uploaded</span>}
+                    {skipped > 0 && <span style={{color:'#eab308'}}>— {skipped} skipped (duplicate)</span>}
+                    {errors  > 0 && <span style={{color:'#ef4444'}}>✕ {errors} failed</span>}
+                  </div>
+                )
+              })()}
+
+              {/* Action buttons */}
+              <div style={{display:'flex', gap:10, justifyContent:'flex-end'}}>
+                {uploadFiles.length > 0 && uploadFiles.every(f => f.status !== 'pending' && f.status !== 'uploading') ? (
+                  <button style={{...S.bigBtn, fontSize:12, padding:'10px 24px'}} onClick={closeUpload}>Done</button>
+                ) : (
+                  <>
+                    <button style={{...S.discardBtn}} onClick={closeUpload}>Cancel</button>
+                    <button
+                      style={{
+                        ...S.confirmBtn,
+                        background: uploadFiles.length > 0 && !uploading ? '#00d4ff' : '#1e2d45',
+                        color:      uploadFiles.length > 0 && !uploading ? '#000' : '#5a7a99',
+                        cursor:     uploadFiles.length > 0 && !uploading ? 'pointer' : 'not-allowed',
+                        padding: '8px 24px',
+                      }}
+                      onClick={handleUpload}
+                      disabled={uploadFiles.length === 0 || uploading}
+                    >
+                      {uploading ? '↑ Uploading...' : `↑ Upload ${uploadFiles.length} file${uploadFiles.length !== 1 ? 's' : ''}`}
+                    </button>
+                  </>
+                )}
+              </div>
+
+            </div>
           </div>
         </div>
       )}
@@ -615,4 +968,11 @@ const S = {
   passInput:    {width:280,padding:'12px 16px',background:'#0f1520',border:'1px solid',borderRadius:6,color:'#c8d8e8',fontSize:14,fontFamily:"'IBM Plex Mono',monospace",outline:'none',textAlign:'center',letterSpacing:'0.2em'},
   passError:    {fontSize:12,color:'#ef4444',fontFamily:"'IBM Plex Mono',monospace",marginTop:6},
   passBtn:      {marginTop:16,padding:'12px 40px',background:'#00d4ff',color:'#000',border:'none',borderRadius:6,cursor:'pointer',fontSize:13,fontFamily:"'IBM Plex Mono',monospace",fontWeight:600,letterSpacing:'0.08em'},
+  warnBox:      {width:'100%',padding:'10px 14px',background:'#f9731611',border:'1px solid #f9731644',borderRadius:6,display:'flex',flexDirection:'column',gap:2,marginTop:8},
+  shortcuts:    {display:'flex',gap:12,flexWrap:'wrap',alignItems:'center',alignSelf:'flex-start',marginTop:8,color:'#5a7a99',fontSize:11,fontFamily:"'IBM Plex Mono',monospace"},
+  kbd:          {display:'inline-block',padding:'1px 5px',background:'#1e2d45',border:'1px solid #2a3f5a',borderRadius:3,fontSize:10,color:'#8aa8c8',fontFamily:"'IBM Plex Mono',monospace"},
+  deleteBtn:    {padding:'2px 8px',background:'transparent',border:'1px solid #ef444444',color:'#ef4444',borderRadius:3,cursor:'pointer',fontSize:10,fontFamily:"'IBM Plex Mono',monospace"},
+  gradePickerWrap: {display:'flex',flexDirection:'column',alignItems:'flex-end',gap:5},
+  gradeBtn:     {width:32,height:28,border:'none',borderRadius:4,cursor:'pointer',fontSize:13,fontFamily:"'IBM Plex Mono',monospace",transition:'all 0.15s'},
+  dropZone:     {border:'2px dashed #1e2d45',borderRadius:8,padding:'32px 24px',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',cursor:'pointer',background:'#0a0e14',transition:'border-color 0.2s'},
 }

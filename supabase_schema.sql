@@ -32,3 +32,21 @@ create table annotations (
 -- Index for fast "fetch next unannotated" query
 create index idx_images_unannotated on images(is_annotated, created_at)
   where is_annotated = false;
+
+-- ============================================================
+-- Migration: allow unlabeled images (heckmatt_grade = NULL)
+-- Run this in Supabase → SQL Editor if you already have the
+-- table created from the original schema above.
+-- ============================================================
+
+-- 1. Drop the NOT NULL constraint and check so grade can be NULL
+alter table images
+  alter column heckmatt_grade drop not null;
+
+alter table images
+  drop constraint if exists images_heckmatt_grade_check;
+
+-- 2. Re-add the check but allow NULL
+alter table images
+  add constraint images_heckmatt_grade_check
+  check (heckmatt_grade is null or heckmatt_grade between 1 and 4);

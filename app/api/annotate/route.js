@@ -15,7 +15,7 @@ export async function POST(request) {
   )
 
   const body = await request.json()
-  const { image_id, boxes, heckmatt_grade, image_filename, is_revisit } = body
+  const { image_id, boxes, heckmatt_grade, image_filename, is_revisit, grade_was_assigned } = body
 
   if (is_revisit) {
     const { error: delError } = await supabase
@@ -23,6 +23,15 @@ export async function POST(request) {
       .delete()
       .eq('image_id', image_id)
     if (delError) return Response.json({ error: delError.message }, { status: 500 })
+  }
+
+  // If the doctor assigned a grade in-app (was unlabeled), persist it to the images table first
+  if (grade_was_assigned) {
+    const { error: gradeError } = await supabase
+      .from('images')
+      .update({ heckmatt_grade })
+      .eq('id', image_id)
+    if (gradeError) return Response.json({ error: gradeError.message }, { status: 500 })
   }
 
   const class_id = heckmatt_grade - 1
