@@ -4,10 +4,10 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 
 const GRADE_COLORS = { 1:'#22c55e', 2:'#eab308', 3:'#f97316', 4:'#ef4444' }
 const GRADE_LABELS = {
-  1:'Normal echogenicity',
-  2:'Increased echogenicity, bone visible',
-  3:'Markedly increased, bone barely visible',
-  4:'Dense shadow, bone not visible',
+  1:'',
+  2:'',
+  3:'',
+  4:'',
 }
 
 // Resize handle size in px (half-width of the square handle)
@@ -68,8 +68,9 @@ export default function AnnotatorPage() {
   const [skippedIds, setSkippedIds]   = useState([])
   const [imgLoaded, setImgLoaded]     = useState(false)
   const [displaySize, setDisplaySize] = useState({ w:0, h:0 })
-  const [isRevisit, setIsRevisit]     = useState(false)
+  const [isRevisit, setIsRevisit]         = useState(false)
   const [selectedGrade, setSelectedGrade] = useState(null)  // for unlabeled images
+  const [changingGrade, setChangingGrade] = useState(false) // for labeled images wanting to change
 
   const [history, setHistory]           = useState([])
   const [historyIndex, setHistoryIndex] = useState(-1)
@@ -134,6 +135,7 @@ export default function AnnotatorPage() {
     setIsRevisit(revisit); setImage(img); setStatus('ready')
     setQualityWarnings([])
     setSelectedGrade(null)
+    setChangingGrade(false)
   }
 
   // ── canvas rendering ──────────────────────────────────────────────────────
@@ -331,7 +333,7 @@ export default function AnnotatorPage() {
           heckmatt_grade:    effectiveGrade,
           image_filename:    image.filename,
           is_revisit:        isRevisit,
-          grade_was_assigned: image.grade === null,  // true when image had no grade
+          grade_was_assigned: image.grade === null || changingGrade,  // true when unlabeled or changing grade
         }),
       })
       const data = await res.json()
@@ -517,18 +519,19 @@ export default function AnnotatorPage() {
     setImgLoaded(true)
   }
 
-  const effectiveGrade = image?.grade ?? selectedGrade
-  const gradeColor = effectiveGrade ? GRADE_COLORS[effectiveGrade] : '#00d4ff'
-  const canSave    = boxes.length >= 1 && !hasDraft && (!isUnlabeled || selectedGrade !== null)
+  const effectiveGrade = (isUnlabeled || changingGrade) ? selectedGrade : image?.grade
+  const gradeColor = effectiveGrade ? GRADE_COLORS[effectiveGrade] : (image?.grade ? GRADE_COLORS[image.grade] : '#00d4ff')
+  const canSave    = boxes.length >= 1 && !hasDraft && (!isUnlabeled || selectedGrade !== null) && (!changingGrade || selectedGrade !== null)
 
   const canGoPrev  = historyIndex > 0
 
   const getInstruction = () => {
-    if (isUnlabeled && !selectedGrade)         return '⚠ Assign a Heckmatt grade (1–4) above before drawing boxes'
-    if (hasDraft)                              return '↕ Drag the corner/edge handles to resize · then Confirm or Discard'
-    if (atLimit && !hasDraft)                  return `✓ Both muscles boxed — review below then click "Save & Next"`
-    if (boxes.length === 0)                    return `↖ Draw box around Muscle 1 (${isRevisit ? 'new boxes will replace old ones' : 'min 1, max 2'})`
-    if (boxes.length === 1 && !isRevisit)      return '↖ Draw box around Muscle 2 (or skip if only one muscle)'
+    if (isUnlabeled && !selectedGrade)              return '⚠ Assign a Heckmatt grade (1–4) above before drawing boxes'
+    if (changingGrade && !selectedGrade)            return '⚠ Select the new grade above, then save'
+    if (hasDraft)                                   return '↕ Drag the corner/edge handles to resize · then Confirm or Discard'
+    if (atLimit && !hasDraft)                       return `✓ Both muscles boxed — review below then click "Save & Next"`
+    if (boxes.length === 0)                         return `↖ Draw box around Muscle 1 (${isRevisit ? 'new boxes will replace old ones' : 'min 1, max 2'})`
+    if (boxes.length === 1 && !isRevisit)           return '↖ Draw box around Muscle 2 (or skip if only one muscle)'
     return '↖ Draw another box if needed'
   }
 
@@ -626,13 +629,50 @@ export default function AnnotatorPage() {
                   </div>
                   {selectedGrade && (
                     <span style={{fontFamily:'IBM Plex Mono,monospace',fontSize:11,color:GRADE_COLORS[selectedGrade]}}>
-                      Grade {selectedGrade} — {GRADE_LABELS[selectedGrade]}
+                      Grade {selectedGrade}
+                    </span>
+                  )}
+                </div>
+              ) : changingGrade ? (
+                <div style={S.gradePickerWrap}>
+                  <span style={{fontFamily:'IBM Plex Mono,monospace',fontSize:11,color:'#c8d8e8'}}>Select new grade:</span>
+                  <div style={{display:'flex',gap:6,alignItems:'center'}}>
+                    {[1,2,3,4].map(g => (
+                      <button
+                        key={g}
+                        style={{
+                          ...S.gradeBtn,
+                          background: (selectedGrade === g) ? GRADE_COLORS[g] : (image.grade === g ? GRADE_COLORS[g]+'44' : GRADE_COLORS[g]+'22'),
+                          border: `1px solid ${GRADE_COLORS[g]}`,
+                          color:  selectedGrade === g ? '#000' : GRADE_COLORS[g],
+                          fontWeight: selectedGrade === g ? 700 : 400,
+                          outline: image.grade === g ? `2px solid ${GRADE_COLORS[g]}88` : 'none',
+                        }}
+                        onClick={() => setSelectedGrade(g === image.grade && selectedGrade === g ? null : g)}
+                      >
+                        {g}
+                      </button>
+                    ))}
+                    <button
+                      style={{...S.navBtn, fontSize:11, padding:'3px 8px'}}
+                      onClick={() => { setChangingGrade(false); setSelectedGrade(null) }}
+                    >✕ Cancel</button>
+                  </div>
+                  {selectedGrade && selectedGrade !== image.grade && (
+                    <span style={{fontFamily:'IBM Plex Mono,monospace',fontSize:11,color:GRADE_COLORS[selectedGrade]}}>
+                      Grade {image.grade} → Grade {selectedGrade}
                     </span>
                   )}
                 </div>
               ) : (
-                <div style={{...S.gradeBadge,background:gradeColor+'22',border:`1px solid ${gradeColor}`,color:gradeColor}}>
-                  Grade {image.grade} — {GRADE_LABELS[image.grade]}
+                <div style={{display:'flex',alignItems:'center',gap:8}}>
+                  <div style={{...S.gradeBadge,background:gradeColor+'22',border:`1px solid ${gradeColor}`,color:gradeColor}}>
+                    Grade {image.grade}
+                  </div>
+                  <button
+                    style={{...S.navBtn, fontSize:11, padding:'3px 8px'}}
+                    onClick={() => { setChangingGrade(true); setSelectedGrade(null) }}
+                  >✎ Change</button>
                 </div>
               )}
             </div>
