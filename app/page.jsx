@@ -68,6 +68,7 @@ export default function AnnotatorPage() {
   const [skippedIds, setSkippedIds]   = useState([])
   const [imgLoaded, setImgLoaded]     = useState(false)
   const [displaySize, setDisplaySize] = useState({ w:0, h:0 })
+  const [pendingBoxes, setPendingBoxes] = useState([])
   const [isRevisit, setIsRevisit]         = useState(false)
   const [selectedGrade, setSelectedGrade] = useState(null)  // for unlabeled images
   const [changingGrade, setChangingGrade] = useState(false) // for labeled images wanting to change
@@ -115,7 +116,7 @@ export default function AnnotatorPage() {
 
   // ── fetch next unannotated ────────────────────────────────────────────────
   const fetchNext = useCallback(async (skips, hist, hIdx, replaceCurrent = false, excludeId = null) => {
-    setStatus('loading'); setBoxes([]); setDraftBox(null); setImgLoaded(false); setIsRevisit(false)
+    setStatus('loading'); setBoxes([]); setPendingBoxes([]); setDraftBox(null); setImgLoaded(false); setIsRevisit(false)
     try {
       const allExcludes = excludeId ? [...skips, excludeId] : skips
       const q = allExcludes.length ? `?skip=${allExcludes.join(',')}` : ''
@@ -132,6 +133,7 @@ export default function AnnotatorPage() {
 
   const loadImage = (img, revisit = false) => {
     setBoxes([]); setDraftBox(null); setImgLoaded(false)
+    setPendingBoxes(img.boxes || [])
     setIsRevisit(revisit); setImage(img); setStatus('ready')
     setQualityWarnings([])
     setSelectedGrade(null)
@@ -144,7 +146,8 @@ export default function AnnotatorPage() {
     if (!canvas || !imgLoaded) return
     const ctx = canvas.getContext('2d')
     ctx.clearRect(0, 0, canvas.width, canvas.height)
-    const color = image ? GRADE_COLORS[image.grade] : '#00d4ff'
+    const activeGrade = (image?.grade === null || changingGrade) ? selectedGrade : image?.grade
+    const color = activeGrade ? GRADE_COLORS[activeGrade] : '#00d4ff'
 
     // Draw each finalized box
     boxes.forEach((b, i) => {
@@ -202,7 +205,7 @@ export default function AnnotatorPage() {
         }
       }
     }
-  }, [boxes, draftBox, drawing, startPos, currentPos, imgLoaded, image, hoverHandle])
+  }, [boxes, draftBox, drawing, startPos, currentPos, imgLoaded, image, hoverHandle, changingGrade, selectedGrade])
 
   const getPos = (e) => {
     const r = canvasRef.current.getBoundingClientRect()
@@ -313,7 +316,7 @@ export default function AnnotatorPage() {
   // ── Save All & Next ───────────────────────────────────────────────────────
   const handleSaveAll = async () => {
     if (boxes.length === 0 || !image) return
-    const effectiveGrade = image.grade ?? selectedGrade
+    const effectiveGrade = (image.grade === null || changingGrade) ? selectedGrade : image.grade
     if (!effectiveGrade) return   // shouldn't reach save without a grade
     setStatus('saving')
     const cw = canvasRef.current.width, ch = canvasRef.current.height
@@ -516,6 +519,16 @@ export default function AnnotatorPage() {
     const dW = Math.floor(img.naturalWidth * ratio); const dH = Math.floor(img.naturalHeight * ratio)
     setDisplaySize({ w:dW, h:dH })
     const canvas = canvasRef.current; canvas.width = dW; canvas.height = dH
+    if (pendingBoxes.length > 0) {
+      const loadedBoxes = pendingBoxes.map(b => ({
+        x: (b.x_center - b.width / 2) * dW,
+        y: (b.y_center - b.height / 2) * dH,
+        w: b.width * dW,
+        h: b.height * dH,
+      }))
+      setBoxes(loadedBoxes)
+      checkQuality(loadedBoxes, dW, dH)
+    }
     setImgLoaded(true)
   }
 

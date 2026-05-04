@@ -20,19 +20,36 @@ export async function GET(request) {
 
   if (annotated) {
     const { data, error } = await supabase
-      .from('images')
-      .select('id, filename, cloudinary_url, heckmatt_grade')
-      .eq('is_annotated', true)
+      .from('annotations')
+      .select('id, x_center, y_center, width, height, heckmatt_grade, created_at, images(id, filename, cloudinary_url, heckmatt_grade)')
       .order('created_at', { ascending: false })
 
     if (error) return Response.json({ error: error.message }, { status: 500 })
 
-    const images = (data || []).map(img => ({
-      id:       img.id,
-      filename: img.filename,
-      grade:    img.heckmatt_grade,
-      url:      img.cloudinary_url,
-    }))
+    const byImage = new Map()
+    for (const row of data || []) {
+      const img = row.images
+      if (!img) continue
+
+      if (!byImage.has(img.id)) {
+        byImage.set(img.id, {
+          id:       img.id,
+          filename: img.filename,
+          grade:    img.heckmatt_grade ?? row.heckmatt_grade,
+          url:      img.cloudinary_url,
+          boxes:    [],
+        })
+      }
+
+      byImage.get(img.id).boxes.push({
+        x_center: row.x_center,
+        y_center: row.y_center,
+        width:    row.width,
+        height:   row.height,
+      })
+    }
+
+    const images = Array.from(byImage.values())
 
     return Response.json({ images })
   }
