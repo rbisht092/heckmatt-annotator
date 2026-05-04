@@ -79,6 +79,8 @@ export default function AnnotatorPage() {
   const [showBrowse, setShowBrowse]       = useState(false)
   const [annotatedList, setAnnotatedList] = useState([])
   const [browseLoading, setBrowseLoading] = useState(false)
+  const [browseQueue, setBrowseQueue]     = useState([])
+  const [browseIndex, setBrowseIndex]     = useState(-1)
 
   // Upload modal
   const [showUpload, setShowUpload]       = useState(false)
@@ -117,6 +119,7 @@ export default function AnnotatorPage() {
   // ── fetch next unannotated ────────────────────────────────────────────────
   const fetchNext = useCallback(async (skips, hist, hIdx, replaceCurrent = false, excludeId = null) => {
     setStatus('loading'); setBoxes([]); setPendingBoxes([]); setDraftBox(null); setImgLoaded(false); setIsRevisit(false)
+    setBrowseQueue([]); setBrowseIndex(-1)
     try {
       const allExcludes = excludeId ? [...skips, excludeId] : skips
       const q = allExcludes.length ? `?skip=${allExcludes.join(',')}` : ''
@@ -131,6 +134,13 @@ export default function AnnotatorPage() {
 
   useEffect(() => { fetchNext([], [], -1) }, [])
 
+  const returnToQueue = () => {
+    setSkippedIds([])
+    setHistory([])
+    setHistoryIndex(-1)
+    fetchNext([], [], -1)
+  }
+
   const loadImage = (img, revisit = false) => {
     setBoxes([]); setDraftBox(null); setImgLoaded(false)
     setPendingBoxes(img.boxes || [])
@@ -138,6 +148,28 @@ export default function AnnotatorPage() {
     setQualityWarnings([])
     setSelectedGrade(null)
     setChangingGrade(false)
+  }
+
+  const loadBrowseImage = (img, index, queue = browseQueue) => {
+    setBrowseQueue(queue)
+    setBrowseIndex(index)
+    const nh = [...history.slice(0, historyIndex + 1), { ...img, is_annotated: true }]
+    setHistory(nh); setHistoryIndex(nh.length - 1)
+    loadImage(img, true)
+  }
+
+  const loadNextBrowseImage = (queue = browseQueue, index = browseIndex) => {
+    if (!queue.length) return false
+    const nextIndex = (index + 1) % queue.length
+    loadBrowseImage(queue[nextIndex], nextIndex, queue)
+    return true
+  }
+
+  const loadPrevBrowseImage = () => {
+    if (!browseQueue.length) return false
+    const prevIndex = (browseIndex - 1 + browseQueue.length) % browseQueue.length
+    loadBrowseImage(browseQueue[prevIndex], prevIndex, browseQueue)
+    return true
   }
 
   // ── canvas rendering ──────────────────────────────────────────────────────
@@ -345,6 +377,13 @@ export default function AnnotatorPage() {
         i === historyIndex ? { ...h, is_annotated: true, grade: effectiveGrade } : h
       )
       setHistory(updatedHistory)
+      if (isRevisit && browseQueue.length > 0) {
+        const updatedBrowseQueue = browseQueue.map((img, i) =>
+          i === browseIndex ? { ...img, grade: effectiveGrade, boxes: normalizedBoxes } : img
+        )
+        loadNextBrowseImage(updatedBrowseQueue, browseIndex)
+        return
+      }
       fetchNext(skippedIds, updatedHistory, historyIndex, false, image.id)
     } catch { setStatus('error') }
   }
@@ -355,12 +394,22 @@ export default function AnnotatorPage() {
   }
 
   const handlePrev = () => {
+    if (isRevisit && browseQueue.length > 0) {
+      loadPrevBrowseImage()
+      return
+    }
+
     if (historyIndex <= 0) return
     const ni = historyIndex - 1; setHistoryIndex(ni)
     loadImage(history[ni], history[ni].is_annotated)
   }
 
   const handleNext = () => {
+    if (isRevisit && browseQueue.length > 0) {
+      loadNextBrowseImage()
+      return
+    }
+
     if (historyIndex < history.length - 1) {
       const ni = historyIndex + 1
       const nextImg = history[ni]
@@ -501,9 +550,7 @@ export default function AnnotatorPage() {
 
   const selectFromBrowse = (img) => {
     setShowBrowse(false)
-    const nh = [...history.slice(0, historyIndex + 1), { ...img, is_annotated: true }]
-    setHistory(nh); setHistoryIndex(nh.length - 1)
-    loadImage(img, true)
+    loadBrowseImage(img, annotatedList.findIndex(i => i.id === img.id), annotatedList)
   }
 
   const handleExport = async () => {
@@ -575,7 +622,9 @@ export default function AnnotatorPage() {
       {/* Header */}
       <header style={S.header}>
         <div style={S.headerLeft}>
-          <span style={S.logo}>HECK<span style={{color:'#00d4ff'}}>MATT</span></span>
+          <button style={S.logo} onClick={returnToQueue} title="Back to normal queue">
+            HECK<span style={{color:'#00d4ff'}}>MATT</span>
+          </button>
           <span style={S.subtitle}>USG Annotation Tool</span>
         </div>
         <div style={S.headerRight}>
@@ -619,7 +668,11 @@ export default function AnnotatorPage() {
               <button style={{...S.navBtn,cursor:'pointer'}} onClick={handleNext}>Next →</button>
             </div>
             <div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap',justifyContent:'flex-end'}}>
-              {isRevisit && <span style={S.revisitBadge}>Revisit — boxes will overwrite</span>}
+              {isRevisit && (
+                <span style={S.revisitBadge}>
+                  Revisit{browseQueue.length > 0 ? ` ${browseIndex + 1}/${browseQueue.length}` : ''} — boxes will overwrite
+                </span>
+              )}
               {isUnlabeled ? (
                 <div style={S.gradePickerWrap}>
                   <span style={{fontFamily:'IBM Plex Mono,monospace',fontSize:11,color:'#f97316'}}>⚠ Unlabeled — assign grade:</span>
@@ -975,7 +1028,7 @@ const S = {
   page:         {minHeight:'100vh',background:'#0a0e14',display:'flex',flexDirection:'column',fontFamily:"'IBM Plex Sans',sans-serif"},
   header:       {display:'flex',justifyContent:'space-between',alignItems:'center',padding:'16px 32px',borderBottom:'1px solid #1e2d45',background:'#0f1520'},
   headerLeft:   {display:'flex',alignItems:'baseline',gap:12},
-  logo:         {fontFamily:"'IBM Plex Mono',monospace",fontSize:18,fontWeight:600,color:'#c8d8e8',letterSpacing:'0.1em'},
+  logo:         {fontFamily:"'IBM Plex Mono',monospace",fontSize:18,fontWeight:600,color:'#c8d8e8',letterSpacing:'0.1em',background:'transparent',border:'none',padding:0,cursor:'pointer'},
   subtitle:     {fontSize:12,color:'#5a7a99',letterSpacing:'0.05em'},
   headerRight:  {display:'flex',alignItems:'center',gap:12},
   hBtn:         {padding:'8px 16px',background:'transparent',border:'1px solid #1e2d45',color:'#5a7a99',borderRadius:4,cursor:'pointer',fontSize:12,fontFamily:"'IBM Plex Mono',monospace"},
