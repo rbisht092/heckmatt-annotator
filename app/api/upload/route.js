@@ -80,6 +80,7 @@ export async function POST(request) {
       // 3. Insert into Supabase with no grade (unlabeled)
       const { error: insertError } = await supabase.from('images').insert({
         filename:       filename,
+        dataset:        'gmc',
         cloudinary_url: cloudResult.secure_url,
         cloudinary_id:  cloudResult.public_id,
         is_annotated:   false,

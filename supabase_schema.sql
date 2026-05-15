@@ -8,6 +8,7 @@
 create table images (
   id              bigint primary key generated always as identity,
   filename        text not null unique,
+  dataset         text not null default 'gmc',
   cloudinary_url  text not null,          -- full CDN URL from Cloudinary
   cloudinary_id   text not null,          -- public_id for reference
   heckmatt_grade  int not null check (heckmatt_grade between 1 and 4),
@@ -24,7 +25,7 @@ create table annotations (
   y_center        float not null,
   width           float not null,
   height          float not null,
-  heckmatt_grade  int not null,
+  heckmatt_grade  int check (heckmatt_grade is null or heckmatt_grade between 1 and 4),
   yolo_txt        text not null,          -- ready-to-use YOLO line
   created_at      timestamptz default now()
 );
@@ -49,4 +50,33 @@ alter table images
 -- 2. Re-add the check but allow NULL
 alter table images
   add constraint images_heckmatt_grade_check
+  check (heckmatt_grade is null or heckmatt_grade between 1 and 4);
+
+-- ============================================================
+-- Migration: add dataset column and mark existing images as GMC
+-- Run this in Supabase -> SQL Editor if the images table already
+-- exists.
+-- ============================================================
+
+alter table images
+  add column if not exists dataset text not null default 'gmc';
+
+update images
+set dataset = 'gmc'
+where dataset is distinct from 'gmc';
+
+-- ============================================================
+-- Migration: allow imported YOLO boxes before Heckmatt grading
+-- Run this in Supabase -> SQL Editor if the annotations table
+-- already exists.
+-- ============================================================
+
+alter table annotations
+  alter column heckmatt_grade drop not null;
+
+alter table annotations
+  drop constraint if exists annotations_heckmatt_grade_check;
+
+alter table annotations
+  add constraint annotations_heckmatt_grade_check
   check (heckmatt_grade is null or heckmatt_grade between 1 and 4);

@@ -16,13 +16,20 @@ export async function GET(request) {
 
   const { searchParams } = new URL(request.url)
   const annotated = searchParams.get('annotated') === 'true'
+  const dataset   = searchParams.get('dataset')
   const skipIds   = searchParams.get('skip')?.split(',').filter(Boolean) || []
 
   if (annotated) {
-    const { data, error } = await supabase
+    let query = supabase
       .from('annotations')
-      .select('id, x_center, y_center, width, height, heckmatt_grade, created_at, images(id, filename, cloudinary_url, heckmatt_grade)')
+      .select('id, x_center, y_center, width, height, heckmatt_grade, created_at, images!inner(id, filename, dataset, cloudinary_url, heckmatt_grade)')
       .order('created_at', { ascending: false })
+
+    if (dataset) {
+      query = query.eq('images.dataset', dataset)
+    }
+
+    const { data, error } = await query
 
     if (error) return Response.json({ error: error.message }, { status: 500 })
 
@@ -35,6 +42,7 @@ export async function GET(request) {
         byImage.set(img.id, {
           id:       img.id,
           filename: img.filename,
+          dataset:  img.dataset,
           grade:    img.heckmatt_grade ?? row.heckmatt_grade,
           url:      img.cloudinary_url,
           boxes:    [],

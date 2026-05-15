@@ -9,6 +9,19 @@ const GRADE_LABELS = {
   3:'',
   4:'',
 }
+const IMPORT_IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'bmp', 'tif', 'tiff', 'webp'])
+
+function fileStem(file) {
+  const name = file.name || ''
+  const idx = name.lastIndexOf('.')
+  return (idx >= 0 ? name.slice(0, idx) : name).toLowerCase()
+}
+
+function fileExt(file) {
+  const name = file.name || ''
+  const idx = name.lastIndexOf('.')
+  return idx >= 0 ? name.slice(idx + 1).toLowerCase() : ''
+}
 
 // Resize handle size in px (half-width of the square handle)
 const HANDLE_R = 6
@@ -81,14 +94,23 @@ export default function AnnotatorPage() {
   const [browseLoading, setBrowseLoading] = useState(false)
   const [browseQueue, setBrowseQueue]     = useState([])
   const [browseIndex, setBrowseIndex]     = useState(-1)
+  const [datasets, setDatasets]           = useState([])
+  const [selectedDataset, setSelectedDataset] = useState(null)
 
   // Upload modal
   const [showUpload, setShowUpload]       = useState(false)
   const [uploadFiles, setUploadFiles]     = useState([])   // [{file, status, reason}]
   const [uploading, setUploading]         = useState(false)
   const uploadInputRef                    = useRef(null)
+  const [importFiles, setImportFiles]     = useState([])
+  const [importDataset, setImportDataset] = useState('')
+  const [importing, setImporting]         = useState(false)
+  const [importProgress, setImportProgress] = useState({ done: 0, total: 0 })
+  const importInputRef                    = useRef(null)
+  const [deletingDataset, setDeletingDataset] = useState(null)
 
   const [authed, setAuthed]         = useState(false)
+  const [role, setRole]             = useState(null)
   const [passInput, setPassInput]   = useState('')
   const [passError, setPassError]   = useState(false)
 
@@ -108,10 +130,16 @@ export default function AnnotatorPage() {
   const [hoverHandle, setHoverHandle]   = useState(null)   // for cursor feedback
 
   const PASSCODE = 'heckmatt2024'
+  const ADMIN_PASSCODE = 'heckmattadmin2024'
 
   const handlePassSubmit = () => {
-    if (passInput === PASSCODE) { setAuthed(true); setPassError(false) }
-    else { setPassError(true); setPassInput('') }
+    if (passInput === ADMIN_PASSCODE) {
+      setAuthed(true); setRole('admin'); setPassError(false)
+    } else if (passInput === PASSCODE) {
+      setAuthed(true); setRole('doctor'); setPassError(false)
+    } else {
+      setPassError(true); setPassInput('')
+    }
   }
 
   const MAX_BOXES = 2
@@ -533,15 +561,122 @@ export default function AnnotatorPage() {
     setUploading(false)
   }
 
+  const onImportFolderPick = (e) => {
+    const picked = Array.from(e.target.files || [])
+    setImportFiles(picked.map(f => ({ file: f, status: 'pending', reason: null })))
+    setImportProgress({ done: 0, total: picked.filter(f => IMPORT_IMAGE_EXTS.has(fileExt(f))).length })
+  }
+
+  const handleImportYolo = async () => {
+    if (importFiles.length === 0 || importing || !importDataset.trim()) return
+    setImporting(true)
+
+    const imageEntries = importFiles.filter(({ file }) => IMPORT_IMAGE_EXTS.has(fileExt(file)))
+    const labelsByStem = new Map()
+    importFiles.forEach(({ file }) => {
+      if (fileExt(file) === 'txt') labelsByStem.set(fileStem(file), file)
+    })
+
+    setImportProgress({ done: 0, total: imageEntries.length })
+    setImportFiles(prev => prev.map(item => ({
+      ...item,
+      status: fileExt(item.file) === 'txt' ? 'skipped' : 'pending',
+      reason: fileExt(item.file) === 'txt' ? 'label file' : null,
+    })))
+
+    let done = 0
+    for (const { file } of imageEntries) {
+      const label = labelsByStem.get(fileStem(file))
+
+      if (!label) {
+        setImportFiles(prev => prev.map(item =>
+          item.file === file ? { ...item, status: 'skipped', reason: 'Missing YOLO label file' } : item
+        ))
+        done += 1
+        setImportProgress({ done, total: imageEntries.length })
+        continue
+      }
+
+      setImportFiles(prev => prev.map(item =>
+        item.file === file ? { ...item, status: 'uploading', reason: null } : item
+      ))
+
+      const form = new FormData()
+      form.append('dataset', importDataset.trim())
+      form.append('files', file, file.webkitRelativePath || file.name)
+      form.append('files', label, label.webkitRelativePath || label.name)
+
+      try {
+        const res = await fetch('/api/import-yolo', { method: 'POST', body: form })
+        const data = await res.json()
+        const result = data.results?.find(r => r.filename === file.name)
+        setImportFiles(prev => prev.map(item =>
+          item.file === file
+            ? { ...item, status: result?.status || 'error', reason: result?.reason || (result?.boxes ? `${result.boxes} boxes` : null) }
+            : item
+        ))
+      } catch {
+        setImportFiles(prev => prev.map(item =>
+          item.file === file ? { ...item, status: 'error', reason: 'Network error' } : item
+        ))
+      }
+
+      done += 1
+      setImportProgress({ done, total: imageEntries.length })
+    }
+
+    setImporting(false)
+  }
+
+  const handleDeleteDataset = async (dataset) => {
+    if (role !== 'admin') return
+    const ok = window.confirm(`Delete dataset "${dataset.name}" from database and Cloudinary? This cannot be undone.`)
+    if (!ok) return
+
+    setDeletingDataset(dataset.name)
+    try {
+      const res = await fetch(`/api/datasets?dataset=${encodeURIComponent(dataset.name)}`, {
+        method: 'DELETE',
+        headers: { 'x-admin-passcode': ADMIN_PASSCODE },
+      })
+      const data = await res.json()
+      if (data.error) throw new Error(data.error)
+      setDatasets(prev => prev.filter(ds => ds.name !== dataset.name))
+      if (selectedDataset?.name === dataset.name) {
+        setSelectedDataset(null)
+        setAnnotatedList([])
+      }
+    } catch (err) {
+      window.alert(`Failed to delete dataset: ${err.message}`)
+    }
+    setDeletingDataset(null)
+  }
+
   const closeUpload = () => {
     setShowUpload(false)
     setUploadFiles([])
+    setImportFiles([])
+    setImportDataset('')
+    setImportProgress({ done: 0, total: 0 })
   }
 
   const openBrowse = async () => {
     setShowBrowse(true); setBrowseLoading(true)
+    setSelectedDataset(null)
+    setAnnotatedList([])
     try {
-      const res = await fetch('/api/images?annotated=true&t=' + Date.now(), { cache: 'no-store' })
+      const res = await fetch('/api/datasets?t=' + Date.now(), { cache: 'no-store' })
+      const data = await res.json()
+      setDatasets(data.datasets || [])
+    } catch { setDatasets([]) }
+    setBrowseLoading(false)
+  }
+
+  const openDataset = async (dataset) => {
+    setSelectedDataset(dataset)
+    setBrowseLoading(true)
+    try {
+      const res = await fetch(`/api/images?annotated=true&dataset=${encodeURIComponent(dataset.name)}&t=${Date.now()}`, { cache: 'no-store' })
       const data = await res.json()
       setAnnotatedList(data.images || [])
     } catch { setAnnotatedList([]) }
@@ -557,6 +692,15 @@ export default function AnnotatorPage() {
     const res = await fetch('/api/export?t=' + Date.now(), { cache: 'no-store' }); const blob = await res.blob()
     const url = URL.createObjectURL(blob); const a = document.createElement('a')
     a.href = url; a.download = 'labels.zip'; a.click(); URL.revokeObjectURL(url)
+  }
+
+  const handleDatasetDownload = async () => {
+    if (!selectedDataset) return
+    const name = selectedDataset.name
+    const res = await fetch(`/api/export?mode=dataset&dataset=${encodeURIComponent(name)}&t=${Date.now()}`, { cache: 'no-store' })
+    const blob = await res.blob()
+    const url = URL.createObjectURL(blob); const a = document.createElement('a')
+    a.href = url; a.download = `${name}_dataset.zip`; a.click(); URL.revokeObjectURL(url)
   }
 
   const onImageLoad = (e) => {
@@ -600,7 +744,7 @@ export default function AnnotatorPage() {
       <div style={S.center}>
         <div style={S.lockIcon}>🔒</div>
         <div style={S.lockTitle}>Enter Passcode</div>
-        <div style={S.lockSub}>Contact the study coordinator for access</div>
+        <div style={S.lockSub}>Doctor access can annotate. Admin access can also delete datasets.</div>
         <input
           type="password"
           value={passInput}
@@ -839,20 +983,61 @@ export default function AnnotatorPage() {
         <div style={S.overlay} onClick={() => setShowBrowse(false)}>
           <div style={S.panel} onClick={e => e.stopPropagation()}>
             <div style={S.panelHeader}>
-              <span style={S.panelTitle}>Annotated Images</span>
+              <span style={S.panelTitle}>{selectedDataset ? `${selectedDataset.name} Images` : 'Choose Dataset'}</span>
               <button style={S.closeBtn} onClick={() => setShowBrowse(false)}>✕</button>
             </div>
             {browseLoading && <div style={{display:'flex',justifyContent:'center',padding:40}}><div style={S.spinner}/></div>}
-            {!browseLoading && annotatedList.length===0 && (
-              <div style={{padding:32,color:'#5a7a99',textAlign:'center',fontSize:13}}>No annotated images yet</div>
+            {!browseLoading && !selectedDataset && datasets.length===0 && (
+              <div style={{padding:32,color:'#5a7a99',textAlign:'center',fontSize:13}}>No datasets found</div>
             )}
-            {!browseLoading && annotatedList.map(img => (
+            {!browseLoading && !selectedDataset && datasets.map(ds => (
+              <div key={ds.name} style={S.datasetItem}>
+                <button style={S.datasetOpenBtn} onClick={() => openDataset(ds)}>
+                  <div style={S.datasetName}>{ds.name}</div>
+                  <div style={S.datasetMeta}>
+                    <span>{ds.total} images</span>
+                    <span>{ds.boxed} boxed</span>
+                    <span>{ds.flaggedAnnotated} marked annotated</span>
+                  </div>
+                </button>
+                {role === 'admin' && (
+                  <button
+                    style={S.datasetDeleteBtn}
+                    onClick={() => handleDeleteDataset(ds)}
+                    disabled={deletingDataset === ds.name}
+                  >
+                    {deletingDataset === ds.name ? 'Deleting...' : 'Delete'}
+                  </button>
+                )}
+              </div>
+            ))}
+            {!browseLoading && selectedDataset && (
+              <div style={S.datasetToolbar}>
+                <button style={S.backBtn} onClick={() => { setSelectedDataset(null); setAnnotatedList([]) }}>
+                  ← Datasets
+                </button>
+                <button style={S.downloadBtn} onClick={handleDatasetDownload}>
+                  ↓ Download Dataset
+                </button>
+              </div>
+            )}
+            {!browseLoading && selectedDataset && annotatedList.length===0 && (
+              <div style={{padding:32,color:'#5a7a99',textAlign:'center',fontSize:13}}>No boxed images in this dataset yet</div>
+            )}
+            {!browseLoading && selectedDataset && annotatedList.map(img => (
               <div key={img.id} style={S.browseItem} onClick={() => selectFromBrowse(img)}>
                 <img src={img.url} alt={img.filename} style={S.thumb}/>
                 <div style={S.browseInfo}>
                   <div style={S.browseName}>{img.filename}</div>
                   <div style={{display:'flex',gap:6,alignItems:'center',flexWrap:'wrap'}}>
-                    <div style={{...S.pill,background:GRADE_COLORS[img.grade]+'22',color:GRADE_COLORS[img.grade],border:`1px solid ${GRADE_COLORS[img.grade]}`}}>Grade {img.grade}</div>
+                    <div style={{
+                      ...S.pill,
+                      background: img.grade ? GRADE_COLORS[img.grade]+'22' : '#f9731622',
+                      color: img.grade ? GRADE_COLORS[img.grade] : '#f97316',
+                      border: `1px solid ${img.grade ? GRADE_COLORS[img.grade] : '#f97316'}`,
+                    }}>
+                      {img.grade ? `Grade ${img.grade}` : 'No grade'}
+                    </div>
                     <button
                       style={S.deleteBtn}
                       onClick={e => { e.stopPropagation(); handleUnannotate(img.id) }}
@@ -1014,6 +1199,87 @@ export default function AnnotatorPage() {
                 )}
               </div>
 
+              <div style={S.modalDivider}/>
+
+              <div style={{display:'flex', flexDirection:'column', gap:12}}>
+                <div>
+                  <div style={S.sectionTitle}>Import YOLO Dataset</div>
+                  <div style={S.sectionSub}>Pick a folder with images and matching .txt labels. Heckmatt grade stays empty for doctor review.</div>
+                </div>
+
+                <input
+                  value={importDataset}
+                  onChange={e => setImportDataset(e.target.value)}
+                  placeholder="dataset name, e.g. ai_preboxed"
+                  style={S.datasetInput}
+                />
+
+                <div
+                  style={S.dropZone}
+                  onClick={() => importInputRef.current?.click()}
+                >
+                  <div style={{fontSize: 28, marginBottom: 8}}>📁</div>
+                  <div style={{fontFamily:'IBM Plex Mono,monospace', fontSize:13, color:'#c8d8e8'}}>
+                    Click to choose YOLO folder
+                  </div>
+                  <div style={{fontFamily:'IBM Plex Mono,monospace', fontSize:11, color:'#5a7a99', marginTop:4}}>
+                    images + same-name .txt labels
+                  </div>
+                  <input
+                    ref={importInputRef}
+                    type="file"
+                    multiple
+                    webkitdirectory=""
+                    directory=""
+                    style={{display:'none'}}
+                    onChange={onImportFolderPick}
+                  />
+                </div>
+
+                {importFiles.length > 0 && (
+                  <>
+                    <div style={S.progressBox}>
+                      <div style={{display:'flex',justifyContent:'space-between',fontFamily:'IBM Plex Mono,monospace',fontSize:11,color:'#8aa8c8'}}>
+                        <span>Images processed</span>
+                        <span>{importProgress.done} / {importProgress.total}</span>
+                      </div>
+                      <div style={S.progressTrack}>
+                        <div style={{...S.progressFill, width: `${importProgress.total ? Math.round((importProgress.done / importProgress.total) * 100) : 0}%`}}/>
+                      </div>
+                    </div>
+                    <div style={{display:'flex', flexDirection:'column', gap:6, maxHeight:180, overflowY:'auto'}}>
+                      {importFiles.map(({ file, status, reason }, i) => {
+                        const icon = status === 'ok' ? '✓' : status === 'error' ? '✕' : status === 'skipped' ? '—' : status === 'uploading' ? '…' : '○'
+                        const col  = status === 'ok' ? '#22c55e' : status === 'error' ? '#ef4444' : status === 'skipped' ? '#eab308' : status === 'uploading' ? '#00d4ff' : '#5a7a99'
+                        return (
+                          <div key={i} style={{display:'flex', alignItems:'center', gap:10, padding:'6px 10px', background:'#0a0e14', borderRadius:4, border:'1px solid #1e2d45'}}>
+                            <span style={{color:col, fontFamily:'IBM Plex Mono,monospace', fontSize:13, width:14, textAlign:'center'}}>{icon}</span>
+                            <span style={{flex:1, fontFamily:'IBM Plex Mono,monospace', fontSize:11, color:'#8aa8c8', wordBreak:'break-all'}}>{file.webkitRelativePath || file.name}</span>
+                            {reason && <span style={{fontFamily:'IBM Plex Mono,monospace', fontSize:10, color:col}}>{reason}</span>}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </>
+                )}
+
+                <div style={{display:'flex', gap:10, justifyContent:'flex-end'}}>
+                  <button
+                    style={{
+                      ...S.confirmBtn,
+                      background: importFiles.length > 0 && importDataset.trim() && !importing ? '#00d4ff' : '#1e2d45',
+                      color:      importFiles.length > 0 && importDataset.trim() && !importing ? '#000' : '#5a7a99',
+                      cursor:     importFiles.length > 0 && importDataset.trim() && !importing ? 'pointer' : 'not-allowed',
+                      padding: '8px 24px',
+                    }}
+                    onClick={handleImportYolo}
+                    disabled={importFiles.length === 0 || !importDataset.trim() || importing}
+                  >
+                    {importing ? 'Importing...' : 'Import YOLO Dataset'}
+                  </button>
+                </div>
+              </div>
+
             </div>
           </div>
         </div>
@@ -1068,6 +1334,14 @@ const S = {
   browseInfo:   {flex:1,display:'flex',flexDirection:'column',gap:6},
   browseName:   {fontFamily:"'IBM Plex Mono',monospace",fontSize:11,color:'#8aa8c8',wordBreak:'break-all'},
   pill:         {alignSelf:'flex-start',padding:'2px 8px',borderRadius:3,fontSize:11,fontFamily:"'IBM Plex Mono',monospace"},
+  datasetItem:  {display:'flex',alignItems:'center',gap:10,width:'100%',padding:'14px 20px',background:'transparent',borderBottom:'1px solid #1e2d4555'},
+  datasetOpenBtn:{flex:1,display:'flex',flexDirection:'column',alignItems:'stretch',gap:8,background:'transparent',border:'none',cursor:'pointer',textAlign:'left',padding:0},
+  datasetDeleteBtn:{padding:'5px 9px',background:'transparent',border:'1px solid #ef444444',color:'#ef4444',borderRadius:4,cursor:'pointer',fontSize:10,fontFamily:"'IBM Plex Mono',monospace"},
+  datasetName:  {fontFamily:"'IBM Plex Mono',monospace",fontSize:14,color:'#c8d8e8',textTransform:'uppercase',letterSpacing:'0.08em'},
+  datasetMeta:  {display:'flex',gap:8,flexWrap:'wrap',fontFamily:"'IBM Plex Mono',monospace",fontSize:11,color:'#5a7a99'},
+  datasetToolbar:{display:'flex',gap:8,alignItems:'center',padding:'12px 20px',borderBottom:'1px solid #1e2d4555',position:'sticky',top:57,background:'#0f1520',zIndex:1},
+  backBtn:      {padding:'6px 10px',background:'transparent',border:'1px solid #1e2d45',color:'#8aa8c8',borderRadius:4,cursor:'pointer',fontSize:11,fontFamily:"'IBM Plex Mono',monospace"},
+  downloadBtn:  {padding:'6px 10px',background:'#00d4ff',border:'1px solid #00d4ff',color:'#000',borderRadius:4,cursor:'pointer',fontSize:11,fontFamily:"'IBM Plex Mono',monospace",fontWeight:600},
   lockIcon:     {fontSize:40,marginBottom:8},
   lockTitle:    {fontSize:22,fontWeight:500,color:'#c8d8e8',marginBottom:4},
   lockSub:      {fontSize:12,color:'#5a7a99',fontFamily:"'IBM Plex Mono',monospace",marginBottom:24},
@@ -1080,5 +1354,12 @@ const S = {
   deleteBtn:    {padding:'2px 8px',background:'transparent',border:'1px solid #ef444444',color:'#ef4444',borderRadius:3,cursor:'pointer',fontSize:10,fontFamily:"'IBM Plex Mono',monospace"},
   gradePickerWrap: {display:'flex',flexDirection:'column',alignItems:'flex-end',gap:5},
   gradeBtn:     {width:32,height:28,border:'none',borderRadius:4,cursor:'pointer',fontSize:13,fontFamily:"'IBM Plex Mono',monospace",transition:'all 0.15s'},
+  modalDivider:  {height:1,background:'#1e2d45',margin:'4px 0'},
+  sectionTitle:  {fontFamily:"'IBM Plex Mono',monospace",fontSize:13,color:'#c8d8e8',letterSpacing:'0.06em'},
+  sectionSub:    {fontFamily:"'IBM Plex Mono',monospace",fontSize:11,color:'#5a7a99',marginTop:4,lineHeight:1.4},
+  datasetInput:  {padding:'10px 12px',background:'#0a0e14',border:'1px solid #1e2d45',borderRadius:6,color:'#c8d8e8',fontSize:12,fontFamily:"'IBM Plex Mono',monospace",outline:'none'},
+  progressBox:   {display:'flex',flexDirection:'column',gap:6,padding:'10px 12px',background:'#0a0e14',border:'1px solid #1e2d45',borderRadius:6},
+  progressTrack: {height:6,background:'#1e2d45',borderRadius:3,overflow:'hidden'},
+  progressFill:  {height:'100%',background:'#00d4ff',borderRadius:3,transition:'width 0.2s'},
   dropZone:     {border:'2px dashed #1e2d45',borderRadius:8,padding:'32px 24px',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',cursor:'pointer',background:'#0a0e14',transition:'border-color 0.2s'},
 }

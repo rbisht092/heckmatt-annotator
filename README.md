@@ -28,7 +28,7 @@ Exports YOLO-format `.txt` labels named after each image, ready for training.
 In Supabase → SQL Editor → paste and run `supabase_schema.sql`
 
 Creates two tables:
-- `images` — filename, cloudinary_url, heckmatt_grade, is_annotated
+- `images` — filename, dataset, cloudinary_url, heckmatt_grade, is_annotated
 - `annotations` — bounding box coords + yolo_txt per image
 
 ---
